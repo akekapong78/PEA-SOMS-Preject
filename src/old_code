@@ -1,0 +1,603 @@
+/* ************************************************************************************* 
+ * PSU 2018 - Smart meter with LoRaWAN 
+ * TTN network and Mitsubishi SX1-A31E
+ * by Mr.Akekapong Kongsavat ID.6010120121
+ * ************************************************************************************/
+#include <SPI.h>
+#include <ModbusMaster.h>   
+#include <lmic.h>
+#include <hal/hal.h>
+#include <Wire.h>               // i2c
+#include "SparkFunHTU21D.h"     // temp & hum
+
+/* ********************** for ABP *******************************************************
+* keys for device ABP
+    * App Session Key copied in MSB format.
+    * Network Session Key -> MSB
+    * DEVADDR = 0x12345678
+* keys for device OTAA
+    * Dev EUI + App EUI will be used in LSB or little Endian format. 
+* **************************************************************************************/
+#define ACT_METHOD_ABP    // define the activation method ABP (or OTAA) for Activate TTN
+
+int dr = DR_SF12;     // set SF factor (7-12)
+static const uint8_t PROGMEM NWKSKEY[16] = { 0x82, 0x5A, 0x8A, 0x4D, 0x65, 0xE4, 0xE6, 0x9A, 0xB4, 0xCB, 0x4D, 0x88, 0xDE, 0x15, 0x69, 0x12 };
+static const uint8_t PROGMEM APPSKEY[16] = { 0xCF, 0x18, 0x5D, 0x86, 0xA7, 0xE8, 0x51, 0x52, 0x1D, 0xFD, 0x51, 0xE8, 0x88, 0x62, 0x07, 0x4B };
+static const uint32_t DEVADDR = 0x260418B7;
+
+// These callbacks are only used in over-the-air activation, so they are
+// left empty when ABP (we cannot leave them out completely unless
+// DISABLE_JOIN is set in config.h, otherwise the linker will complain).
+
+#ifdef ACT_METHOD_ABP
+  void os_getArtEui (u1_t* buf) { }
+  void os_getDevEui (u1_t* buf) { }
+  void os_getDevKey (u1_t* buf) { }
+#else
+  void os_getArtEui (u1_t* buf) { memcpy_P(buf, APPEUI, 8);}
+  void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8);}
+  void os_getDevKey (u1_t* buf) { memcpy_P(buf, APPKEY, 16);}
+#endif
+// Declare the job control structures
+static osjob_t sendjob;
+
+
+/* ************************************************************************************* 
+ * Setting Temp & Humidity Sensor
+ * *********************************************************************************** */
+HTU21D myHumidity;            // Create an instance of the object
+float temperature   = 0;
+float humidity      = 0;
+uint16_t tempC_int  = 0;
+uint16_t hum_int    = 0;
+int8_t code_temp    = 0x67;   // code for IPSO standard (to cayenne)
+int8_t code_humid   = 0x68;
+
+
+/* ************************************************************************************* 
+ * Setting Meter Side 
+ * *********************************************************************************** */
+ModbusMaster nodemeter;           // Declare Modbus
+#define MAX485_DE      2          // MAX485 setting mode
+#define MAX485_RE_NEG  2          // MAX485 setting mode
+#define METER_ADDR     1          // address 72
+#define ADDR_START     0x0064     // ตำแหน่ง address ของ register ที่ต้องการอ่านค่าเริ่มต้นตั้งแต่ 100 ขึ้นไป                             
+#define ADDR_NUMBER    16         // จำนวน register ที่ต้องการทั้งหมด
+void preTransmission(){           // TX Modbus
+  digitalWrite(MAX485_RE_NEG, 1);
+  digitalWrite(MAX485_DE, 1);   }
+void postTransmission(){          // RX Modbus
+  digitalWrite(MAX485_RE_NEG, 0);
+  digitalWrite(MAX485_DE, 0);   }
+
+  
+/* ************************************************************************************* 
+ *  Smart Meter parameter 
+ * *************************************************************************************/
+uint16_t V = 0;             // uint16_t ไม่เกิน 0-65,535  (2byte) , uint8_t ไม่เกิน 0-255
+uint16_t A = 0;
+uint16_t W = 0;             // มิเตอร์ 45A*230V = 10,350W  <  uint16_t
+uint32_t Wh = 0;            // uint32_t ไม่เกิน 0-4,294,967,295
+uint16_t F = 0;             // ex f = 502 -> 50.2 ต้องใช้ uint16_t
+float PF = 0;               // หารเอง  เอาทศนิยมด้วย
+uint16_t power_f = 0;       // รับค่า build data
+uint16_t lit = 0;           // ลิตร จน.เต็ม water flow sensor  2 byte 
+int8_t ch0=0x00,ch1=0x01,ch2=0x02,ch3=0x03,ch4=0x04,      // กำหนด chanal ตาม IPSO
+       ch5=0x05,ch6=0x06,ch7=0x07,ch8=0x08;           
+int8_t code_analog_in = 0x02;  
+byte mydata[35];     // build package
+/* ====== int i = 35; ============================
+ * volt: ch0,id,2 -> 4
+ * amp: ch1,id,2 -> 4  
+ * pf: ch2,id,2 -> 4
+ * watt: ch3,id,2 -> 4
+ * kwh: ch4,id,2 -> 4
+ * f: ch5,id,2 -> 4 
+ * lit: ch6,id,2 -> 4
+ * tempC_int: ch7,id,2 -> 4
+ * hum_int: ch8,id,1 -> 3
+  ======= code for IPSO standard (to cayenne) ====
+  int8_t code_digital_in = 0x00;
+  int8_t code_digital_out = 0x01;  
+  int8_t code_analog_in = 0x02;
+  int8_t code_analog_out = 0x03;  
+  int8_t code_temp = 0x67;
+  int8_t code_humid = 0x68;   
+ ================================================= */              
+ 
+
+/* ************************************************************** 
+ * Pin mapping  RFM95 LoRa
+ * *************************************************************/
+const lmic_pinmap lmic_pins = {
+    .nss = 3,      // เปลี่ยนจาก10 เป็น3 เพื่อหลีกช่องว่างฟุตปริ้น ของ Mega2560
+    .rxtx = LMIC_UNUSED_PIN,
+    .rst = 0,  
+    .dio = {4, 5, 7},
+};
+
+
+
+/* **************************************************************
+ * low power Lib  for Sleep mode
+ * *************************************************************/
+// low power library does not work for Sodaq processor (ARM)
+#ifndef _Sodaq_RN2483_h
+  #include "LowPower.h"
+#endif
+
+// show debug statements; comment next line to disable debug statements
+#define DEBUG
+
+
+/* **************************************************************
+ * Sleep period  settings
+ * *************************************************************/
+unsigned long cycle_length = 60 * 1 * 1000UL; // cycle * mins_or_secs * 1000;  // set 20 sec.
+unsigned long sense_every = 1;     // กำหนดว่าส่งทุกกี่รอบ หยุดกี่รอบ เทียบจำนวน cycle (ดูใน setup)
+unsigned long send_every = 1;      // กำหนดว่าส่งทุกกี่รอบ หยุดกี่รอบ เทียบจำนวน cycle (ดูใน setup)
+
+unsigned long cycle = -1;  //  init at -1, so first cycle starts as cycle 0 for 1st sense/send
+unsigned long prevSleep = 0; 
+
+
+
+/* **************************************************************
+ * setup
+ * *************************************************************/
+void setup() {
+  
+  while ((!Serial) && (millis() < 10000)){ }    // Wait (max 10 seconds) for the Serial Monitor
+  Serial.begin(115200);     //Set baud rate  
+  Serial.println(F(">>> Smart Meter-IoT with LoRaWAN in PSU & PEA <<<"));
+  
+  init_sensor();   // set Modbus
+  init_node();     //set all LoRa Module
+  
+} // end setup()
+
+
+
+/* **************************************************************
+ * loop
+ * *************************************************************/
+void loop() {
+  
+  cycle += 1;     // นับรอบ next cycle ต่อจาก setup
+
+  if ( (cycle % sense_every) == 0 ) { // check if we need to sense  ตรวจสอบการส่งค่า และ ส่งค่า
+     do_sense();       // อ่านค่าจา Mosbus เก็บใช้ตัวแปล แล้วพิมม์ออกมา + Build data ด้วย
+  } 
+  if ( (cycle % send_every) == 0 ) {  // check if need to send
+     build_data();    // สร้าง package เป็นจำนวนเต็ม ใส่ใน buffer
+     do_send();       // ส่งข้อมูลผ่าน lora
+  }
+  
+  //  cal. to Sleep mode
+  unsigned long current = millis();
+  do_sleep(cycle_length - (current - prevSleep));  // sleep minus elapsed time
+  prevSleep = current;
+  // Sodaq has no sleep, adjust prevSleep
+  #ifdef _Sodaq_RN2483_h
+    prevSleep += cycle_length;
+  #endif
+} // end loop()
+
+
+
+/* **************************************************************
+ * init the sensor for Modbus + Water + TempHum
+ * *************************************************************/
+void init_sensor() {
+  
+  Wire.begin();             // join i2c bus (address optional for master)
+  myHumidity.begin();       // join i2c HTU21D Humidity Sensor add: 0x40 fig.
+  
+  pinMode(MAX485_RE_NEG, OUTPUT);       // ประกาศ output pin 8  ขา RE,DE
+  pinMode(MAX485_DE, OUTPUT);
+  digitalWrite(MAX485_RE_NEG, 0);       //  set LOW to RX mode standby
+  digitalWrite(MAX485_DE, 0);   
+ 
+  Serial1.begin(1200,SERIAL_8E1);     //Set baud rate Modbus
+  nodemeter.begin(METER_ADDR, Serial1);   // slave id = 1 + serial ที่ใช้สื่อสาร modbus 
+  nodemeter.preTransmission(preTransmission);   // เริ่มต้นการสื่อสาร ผ่าน Modbus
+  nodemeter.postTransmission(postTransmission);
+} // end init_sensor()
+
+
+
+/* ******************************************************************************
+ * do reading   // อ่านค่าจาก Mosbus เก็บใช้ตัวแปร แล้วพิมม์ออกมา
+ * *****************************************************************************/
+void do_sense() {
+
+#ifdef DEBUG 
+/* ************************** ยกชุด setup ************************************* */  
+   uint8_t result;
+   Serial.println(".....................................................................");
+   Serial.println(".........................READ..All..SENSOR...........................");      
+   result = nodemeter.readHoldingRegisters(ADDR_START, ADDR_NUMBER); // Dec. start 40100        
+      // if เพื่อตรวจสอบว่า modbus อ่านค่าได้หรือไม่ ถ้าได้ ก็ดึงค่าออกมา  
+      if (result == nodemeter.ku8MBSuccess) {   
+          V = nodemeter.getResponseBuffer(0x02) ;   //Dec. reg. 40103 - 40100 -1 = 2
+          F = nodemeter.getResponseBuffer(0x05);    //Dec. reg. 40106 - 40100 -1 = 5
+          Wh = nodemeter.getResponseBuffer(0x0A)+nodemeter.getResponseBuffer(0x0B); //Dec. reg. 40111 - 40100 -1 = 10 (มี 2ปล็อค 4byte)    
+          A = nodemeter.getResponseBuffer(0x0C);    //Dec. reg. 40113 - 40100 -1 = 12
+          W = nodemeter.getResponseBuffer(0x0F);    //Dec. reg. 40116 - 40100 -1 = 15                                     
+      }else{
+        Serial.print("Modbus Error Meter not Connected (");
+        Serial.print(result,HEX);  
+        Serial.println(")");
+        V=0;A=0;F=0;W=0;  
+      }
+      // จบการดึงค่า(Meter sx1)  ก็จะแสดงผลค่าจาก sensor ทั้งหมด ดังนี้
+          Serial.print("Line Voltage (RMS) (V) >>>>> ");
+          Serial.println((float)V/100,2); // Line Voltage (RMS) (V) 
+                                
+          Serial.print("Frequency (Hz) >>>>> ");
+          Serial.println((float)F/10,1); // Frequency (Hz)    
+                
+          Serial.print("Active Energy (kWh) imp+exp >>>>> ");    
+          Serial.println((float)Wh/1000,3); // Active Energy (Wh) imp+exp  
+          
+          Serial.print("Line Current (RMS) (A) >>>>> ");
+          Serial.println((float)A/100,2); // Line Current (RMS) (A)    
+          
+          Serial.print("Active Power (Watt) >>>>> ");
+          Serial.println(W); // Active Power (W)         
+          
+          Serial.print("Power Factor (PF) >>>>> ");
+          PF = (float)W / (((float)V*(float)A)/10000) ;
+          if(A*V == 0){
+            Serial.println("No Load !!! ");     PF = 0;            
+          }else      
+            Serial.println(PF,2);     
+
+          Serial.print("Water Meter (Lite) >>>>> ");
+          byte buff_lit[4];                               // บัฟเฟอร์รอรับค่า     
+          uint8_t n = Wire.requestFrom(8, 4);             // อ่าน slvae i2c address 0x08 จำนวน 4 byte 
+          Wire.readBytes(buff_lit, n);                    // อ่านค่าเก็บใส่ array buffer กล่องละ byte
+          lit = (buff_lit[0] << 8) | buff_lit[1];       // รวม bit จาก 2 byte แรก
+          Serial.println(lit); 
+
+          Serial.print("Temperature (*C) >>>>> ");
+          temperature = myHumidity.readTemperature();     // อ่านค่าอุณหภูมิ องศา c
+          Serial.println(temperature,2); 
+
+          Serial.print("humidity (%) >>>>> ");
+          humidity = myHumidity.readHumidity();           // อ่านค่าความชื้น หน่วย %
+          Serial.println(humidity,1); 
+          
+      Serial.println("......................................................................");
+      Serial.println(".........................LoRaWAN..TECNOLOGY..........................."); 
+      delay(500);  
+/* ************************** ยกชุด setup ************************************* */       
+#endif
+}
+
+
+/* *******************************************************************************
+ * build data to transmit in dataTX ปรับค่าในตัวแปล ให้เป็นจำนวนเต็ม พร้อมเพื่อส่ง package
+ * *******************************************************************************/
+void build_data() {
+   
+    int index = 0;    // i++ จะเพิ่มค่าตนเองขึ้น 1 หลังจากจบประโยค ;
+
+    // ch0 = voltage
+    mydata[index++] = ch0;      
+    mydata[index++] = code_analog_in;    
+    mydata[index++] = (V >> 8) & 0xFF ;      
+    mydata[index++] = V & 0xFF;
+    // ch1 = current
+    mydata[index++] = ch1;
+    mydata[index++] = code_analog_in;          
+    mydata[index++] = (A >> 8) & 0xFF;
+    mydata[index++] = A & 0xFF;
+    // ch2 = power factor
+    power_f = PF*100;
+    mydata[index++] = ch2;
+    mydata[index++] = code_analog_in;        
+    mydata[index++] = (power_f >> 8) & 0xFF;
+    mydata[index++] = power_f & 0xFF;   
+    // ch3 = power     
+    mydata[index++] = ch3;
+    mydata[index++] = code_analog_in;        
+    mydata[index++] = (W >> 8) & 0xFF;
+    mydata[index++] = W & 0xFF;  
+    // ch4 = energy wh  
+    mydata[index++] = ch4;
+    mydata[index++] = code_analog_in;  
+    mydata[index++] = (Wh >> 8) & 0xFF;     //  เขียนแบบ 2byte ก่อน(จริงๆต้อง4) เก็บค่าได้ 65535 หน่วย
+    mydata[index++] = Wh & 0xFF;         
+    // ch5 = freq 
+    mydata[index++] = ch5;
+    mydata[index++] = code_analog_in;
+    mydata[index++] = (F >> 8) & 0xFF;
+    mydata[index++] = F & 0xFF;       
+    // ch6 = water lite 
+    mydata[index++] = ch6;
+    mydata[index++] = code_analog_in;
+    mydata[index++] = (lit >> 8) & 0xFF;
+    mydata[index++] = lit & 0xFF;  
+    // ch7 = temp 
+    tempC_int = temperature*100;       // 2byte  ตาม IPSO table เก็บทศนิยมเดียว
+    mydata[index++] = ch7;
+    mydata[index++] = code_temp;    
+    mydata[index++] = (tempC_int >> 8) & 0xFF;
+    mydata[index++] = tempC_int & 0xFF;   
+    // ch8 = humidity 
+    hum_int = humidity;       // 1byte 0-256 จึงเอาทศนิยมไม่ได้ เก็บ 0-100% 
+    mydata[index++] = ch8;
+    mydata[index++] = code_humid; 
+    mydata[index++] = hum_int & 0xFF;   
+   
+    Serial.print("My payload (size=");               // แสดง package ที่สร้างขึ้น
+    Serial.print(sizeof(mydata)); 
+    Serial.print(") : ");
+    for(int i=0; i<sizeof(mydata) ; i++) {
+      Serial.print(mydata[i],HEX);  Serial.print(" ");
+    }
+    Serial.println(" END.");
+/* =========== set Decode Payload in TTN =======================
+function Decoder(bytes, port) 
+{ var i=0;
+    
+    if (bytes[i++] == 0x00 && bytes[i++] == 0x02) 
+      var volt = (bytes[i++] << 8) | bytes[i++];  
+   
+    if (bytes[i++] == 0x01 && bytes[i++] == 0x02) 
+      var amp = (bytes[i++] << 8) | bytes[i++];  
+
+    if (bytes[i++] == 0x02 && bytes[i++] == 0x02) 
+      var power_f = (bytes[i++] << 8) | bytes[i++];  
+   
+    if (bytes[i++] == 0x03 && bytes[i++] == 0x02) 
+      var watt = (bytes[i++] << 8) | bytes[i++];  
+  
+    if (bytes[i++] == 0x04 && bytes[i++] == 0x02) 
+      var kWh = (bytes[i++] << 8) | bytes[i++];  
+   
+    if (bytes[i++] == 0x05 && bytes[i++] == 0x02) 
+      var freq = (bytes[i++] << 8) | bytes[i++];  
+      
+    if (bytes[i++] == 0x06 && bytes[i++] == 0x02) 
+      var lit = (bytes[i++] << 8) | bytes[i++];     
+   return { Volt: volt/100 
+            Current: amp/100
+            PF: power_f/100
+            Power: watt
+            EnergyUnit: kWh/1000
+            freq: freq/10
+            WaterUnit: lit
+          };
+} ===================================================================== */  
+} // end build_data()
+
+
+/* **************************************************************
+ * send the message
+ * *************************************************************/
+void do_send() {
+
+  Serial.print(millis());
+  Serial.print(F(" : Sending... "));  
+
+  send_message(&sendjob);   // เรียก fn ส่ง package
+
+  Serial.print(millis());
+  Serial.print(F(" : Waiting... "));  
+ 
+  while ( (LMIC.opmode & OP_JOINING) or (LMIC.opmode & OP_TXRXPEND) ) { os_runloop_once();  }
+  Serial.print(millis());
+  Serial.println(F(" : TX_COMPLETE"));
+
+}
+
+
+  
+/* *****************************************************************************
+* send_message
+* ******************************************************************************/
+void send_message(osjob_t* j) {
+  
+  // Check if there is not a current TX/RX job running
+  if (LMIC.opmode & OP_TXRXPEND) {    
+    Serial.println("");        
+    Serial.print(millis());
+    Serial.println(F(" : OP_TXRXPEND, not sending"));    
+  } else {
+   // Prepare upstream data transmission at the next possible time.
+   // lib = int   LMIC_setTxData2   (u1_t port, xref2u1_t data, u1_t dlen, u1_t confirmed);
+   
+   LMIC_setTxData2(1, mydata, sizeof(mydata), 0);    // คำสั่งส่ง package
+   Serial.print(millis());
+   Serial.println(F(" : Packet queued"));
+  }
+}
+
+
+/* *************************************************************************************
+* sleep mode >>> LowPower lib
+* ************************************************************************************/
+void do_sleep(float sleepTime) {
+
+  #ifdef DEBUG
+    Serial.print(F("Sleep for : "));
+    Serial.print(sleepTime/1000, 3);
+    Serial.println(F(" seconds"));
+    Serial.println();
+  #endif
+
+  Serial.flush();
+
+  #ifndef _Sodaq_RN2483_h
+    // sleep logic using LowPower library
+    int delays[] = {8000, 4000, 2000, 1000, 500, 250, 120, 60, 30, 15};
+    period_t sleep[] = {SLEEP_8S, SLEEP_4S, SLEEP_2S, SLEEP_1S, SLEEP_500MS,  SLEEP_250MS, SLEEP_120MS, SLEEP_60MS, SLEEP_30MS, SLEEP_15MS};
+
+    // correction for overhead in this routine
+    sleepTime = sleepTime * 0.93;
+
+    float x;
+    unsigned int i;
+    for (i=0; i<=9; i++) {
+      for (x=sleepTime; x>=delays[i]; x-=delays[i]) {
+        LowPower.powerDown(sleep[i], ADC_OFF, BOD_OFF);
+        sleepTime -= delays[i];
+      } 
+    }
+  #else
+    // no LowPower implemented yet, so just a delay
+    delay(sleepTime);
+  #endif
+
+} // end do_sleep()
+
+
+
+/* *************************************************************************************
+ * init the Node for LoRaWAN setting
+ * ************************************************************************************/
+void init_node() {
+  #ifdef VCC_ENABLE
+     // For Pinoccio Scout boards
+     pinMode(VCC_ENABLE, OUTPUT);
+     digitalWrite(VCC_ENABLE, HIGH);
+     delay(1000);
+  #endif
+
+  // LMIC init
+  os_init();
+  // Reset the MAC state. Session and pending data transfers will be discarded.
+  LMIC_reset();
+
+  #ifdef ACT_METHOD_ABP
+    // Set static session parameters. Instead of dynamically establishing a session
+    // by joining the network, precomputed session parameters are be provided.
+    #ifdef PROGMEM
+      // On AVR, these values are stored in flash and only copied to RAM
+      // once. Copy them to a temporary buffer here, LMIC_setSession will
+      // copy them into a buffer of its own again.
+      uint8_t appskey[sizeof(APPSKEY)];
+      uint8_t nwkskey[sizeof(NWKSKEY)];
+      memcpy_P(appskey, APPSKEY, sizeof(APPSKEY));
+      memcpy_P(nwkskey, NWKSKEY, sizeof(NWKSKEY));
+      LMIC_setSession (0x1, DEVADDR, nwkskey, appskey);
+    #else
+      // If not running an AVR with PROGMEM, just use the arrays directly
+      LMIC_setSession (0x1, DEVADDR, NWKSKEY, APPSKEY);
+    #endif
+
+ 
+    // Set up the channels used by the Things Network, which corresponds
+    // to the defaults of most gateways. Without this, only three base
+    // channels from the LoRaWAN specification are used, which certainly
+    // works, so it is good for debugging, but can overload those
+    // frequencies, so be sure to configure the full frequency range of
+    // your network here (unless your network autoconfigures them).
+    // Setting up channels should happen after LMIC_setSession, as that
+    // configures the minimal channel set.
+
+    // แก้ package มา1หาย2  ด้วยการ fix f=923.2 ที่ฝั้ง GW และต้อง config node ให้ครบ 3 ch แบบนี้ ถึงจะปล่อยความพี่เดียว ไม่วิ่ง
+    // in lib =  LMIC_setupBand (u1_t bandidx, s1_t txpow, u2_t txcap);
+    LMIC_setupChannel(0, 923200000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band    
+    LMIC_setupChannel(1, 923200000, DR_RANGE_MAP(DR_SF12, DR_SF7B), BAND_CENTI);      // g-band
+    LMIC_setupChannel(2, 923200000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
+    
+    // TTN defines an additional channel at 869.525Mhz using SF9 for class B
+    // devices' ping slots. LMIC does not have an easy way to define set this
+    // frequency and support for class B is spotty and untested, so this
+    // frequency is not configured here.
+
+    // Disable link check validation
+    LMIC_setLinkCheckMode(0);
+
+    // DR_SF9 เป็น default ping DR  เวลา server ตอบรับจึงเป็น SF9
+    // TTN uses SF9 for its RX2 window.
+    LMIC.dn2Dr = DR_SF9;
+
+    // ตั้งค่า SF7  และ กำลังการส่ง 14 dBm
+    // Set data rate and transmit power (note: txpow seems to be ignored by the library)
+    // void  LMIC_setDrTxpow   (dr_t dr, s1_t txpow);  // set default/start DR/txpow
+    LMIC_setDrTxpow(dr,14);   
+    
+  #endif
+
+  #ifdef ACT_METHOD_OTAA
+    // got this fix from forum: https://www.thethingsnetwork.org/forum/t/over-the-air-activation-otaa-with-lmic/1921/36
+    LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
+  #endif
+
+} //end init_node()
+
+
+/* *************************************************************************************
+ * onEvent  LoRaWAN
+ * ************************************************************************************/
+void onEvent (ev_t ev) {      
+  Serial.print(millis());
+  Serial.println(": onEvent >> ");    
+  switch (ev) {
+    case EV_SCAN_TIMEOUT:
+      Serial.println(F("EV_SCAN_TIMEOUT"));
+      break;
+    case EV_BEACON_FOUND:
+      Serial.println(F("EV_BEACON_FOUND"));
+      break;
+    case EV_BEACON_MISSED:
+      Serial.println(F("EV_BEACON_MISSED"));
+      break;
+    case EV_BEACON_TRACKED:
+      Serial.println(F("EV_BEACON_TRACKED"));
+      break;
+    case EV_JOINING:
+      Serial.println(F("EV_JOINING"));
+      break;
+    case EV_JOINED:
+      Serial.println(F("EV_JOINED"));
+      // Disable link check validation (automatically enabled
+      // during join, but not supported by TTN at this time).
+      LMIC_setLinkCheckMode(0);
+      break;
+    case EV_RFU1:
+      Serial.println(F("EV_RFU1"));
+      break;
+    case EV_JOIN_FAILED:
+      Serial.println(F("EV_JOIN_FAILED"));
+      break;
+    case EV_REJOIN_FAILED:
+      Serial.println(F("EV_REJOIN_FAILED"));
+      break;
+    case EV_TXCOMPLETE:
+      Serial.println(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
+      if (LMIC.dataLen) {
+        // data received in rx slot after tx
+        Serial.print(F("Data Received: "));
+        Serial.write(LMIC.frame+LMIC.dataBeg, LMIC.dataLen);
+        Serial.println();
+      }
+      // schedule next transmission
+      // os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(TX_INTERVAL), send_message);
+      break;
+    case EV_LOST_TSYNC:
+      Serial.println(F("EV_LOST_TSYNC"));
+      break;
+    case EV_RESET:
+      Serial.println(F("EV_RESET"));
+      break;
+    case EV_RXCOMPLETE:
+      // data received in ping slot
+      Serial.println(F("EV_RXCOMPLETE"));
+      break;
+    case EV_LINK_DEAD:
+      Serial.println(F("EV_LINK_DEAD"));
+      break;
+    case EV_LINK_ALIVE:
+      Serial.println(F("EV_LINK_ALIVE"));
+      break;
+    default:
+      Serial.println(F("Unknown event"));
+      break;
+  }
+    
+}
